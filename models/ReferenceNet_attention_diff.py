@@ -51,7 +51,6 @@ class ReferenceNetAttention():
             gn_auto_machine_weight,
             style_fidelity,
             reference_attn,
-            # dtype=torch.float16,
             dtype=torch.float32,
             batch_size=1, 
             num_images_per_prompt=1, 

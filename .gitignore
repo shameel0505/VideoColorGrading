@@ -1,0 +1,13 @@
+venv/
+pretrained_models/
+__pycache__/
+*.pyc
+*.log
+backend.log
+temp_target.jpg
+temp_target.mp4
+final_output.jpg
+final_output.mp4
+perfect_reference.png
+frontend/node_modules/
+.env

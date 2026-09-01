@@ -32,7 +32,12 @@ class Inference():
         config  = OmegaConf.load(config)  
         inference_config = OmegaConf.load(config.inference_config)
         
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if torch.cuda.is_available():
+            device = 'cuda'
+        elif torch.backends.mps.is_available():
+            device = 'mps'
+        else:
+            device = 'cpu'
 
         ### >>> create diffusion pipeline >>> ###
         vae = AutoencoderKL.from_pretrained(config.pretrained_sd_path, subfolder="vae")
@@ -98,7 +103,7 @@ class Inference():
             torch.manual_seed(random_seed)
             set_seed(random_seed)
        
-            generator = torch.Generator(device=torch.device("cuda:0"))
+            generator = torch.Generator(device=torch.device(device))
             generator.manual_seed(torch.initial_seed())
         
             lut = self.pipeline(

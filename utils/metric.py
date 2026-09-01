@@ -32,7 +32,12 @@ def calculate_psnr(gt_video, output_video):
 
 def calculate_lpips_batch(loss_fn, gt_video, output_video, batch_size):
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if torch.cuda.is_available():
+        device = 'cuda'
+    elif torch.backends.mps.is_available():
+        device = 'mps'
+    else:
+        device = 'cpu'
     lpips_values = []
 
     tensors_a = [lpips.im2tensor(np.array(frame.resize(output_video[0].size))).to(device) for frame in gt_video]
@@ -72,7 +77,12 @@ def evaluate(gt_video, output_video, ref_image):
 
     ssim = round(calculate_ssim(gt_video, output_video), 4)
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if torch.cuda.is_available():
+        device = 'cuda'
+    elif torch.backends.mps.is_available():
+        device = 'mps'
+    else:
+        device = 'cpu'
     lpips_loss_fn = lpips.LPIPS(net="vgg").to(device)
     lpip = round(calculate_lpips_batch(lpips_loss_fn, gt_video, output_video, 20), 4)
 

@@ -201,7 +201,7 @@ class InferencePipeline(DiffusionPipeline):
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps
 
-        embedding_dtype = torch.float32
+        embedding_dtype = self.unet.dtype
 
         latents = self.prepare_latents(
             batch_size,
@@ -238,8 +238,8 @@ class InferencePipeline(DiffusionPipeline):
                 clip_src = clip_src_vector
                 ref_img = source_image[0]
                 clip_ref = clip_ref_vector
-        src_image_latents = self.images2latents(src_img[None, :], latents_dtype).cuda()
-        ref_image_latents = self.images2latents(ref_img[None, :], latents_dtype).cuda()
+        src_image_latents = self.images2latents(src_img[None, :], latents_dtype).to(device=latents.device)
+        ref_image_latents = self.images2latents(ref_img[None, :], latents_dtype).to(device=latents.device)
         encoder_hidden_states = torch.cat([clip_ref, clip_src], dim=0) # [bs,1,768]
         clip_diff = clip_ref - clip_src
 
@@ -256,10 +256,15 @@ class InferencePipeline(DiffusionPipeline):
             if i == 0:
                 # just once
                 referencenet.to(device=latents.device)
+                
+                # Force dtypes for MPS safety
+                safe_ref_input = ref_input.to(self.unet.dtype)
+                safe_encoder_hidden_states = encoder_hidden_states.to(self.unet.dtype)
+                
                 referencenet(
-                    ref_input,
-                    torch.zeros_like(t),
-                    encoder_hidden_states=encoder_hidden_states,
+                    safe_ref_input,
+                    torch.zeros_like(t, dtype=self.unet.dtype),
+                    encoder_hidden_states=safe_encoder_hidden_states,
                     return_dict=False,
                 )
                 reference_control_reader.update(reference_control_writer)
@@ -273,14 +278,19 @@ class InferencePipeline(DiffusionPipeline):
             
 
             noisy_latents = torch.cat([latent_model_input, latents_pose_input], dim=1)
+            
+            # Force dtypes for MPS safety
+            noisy_latents = noisy_latents.to(self.unet.dtype)
+            safe_clip_diff = clip_diff.to(self.unet.dtype)
+            
             pred = self.unet(
                     noisy_latents, 
                     t, 
-                    encoder_hidden_states=clip_diff,
+                    encoder_hidden_states=safe_clip_diff,
                     return_dict=False,
                 )[0]
             
-            latents = self.scheduler.step(pred, t, latents, **extra_step_kwargs).prev_sample
+            latents = self.scheduler.step(pred.to(latents.dtype), t, latents, **extra_step_kwargs).prev_sample
             if is_dist_initialized:
                 dist.broadcast(latents, 0)
                 dist.barrier()
