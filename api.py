@@ -30,17 +30,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize AI models if available
+# Initialize AI models if available (Lazy Loaded)
 grader = None
-try:
-    print("Checking AI Pipeline Models...")
-    from grading import Inference
-    config_args = SimpleNamespace(config='configs/prompts/video_demo.yaml')
-    grader = Inference(config=config_args.config)
-    print("AI Diffusion Models loaded successfully!")
-except Exception as e:
-    print(f"Notice: Running in direct 3D LUT Color Transfer mode ({e})")
-    grader = None
+model_load_error = None
+is_model_loaded = False
+
+def lazy_load_grader():
+    global grader, is_model_loaded, model_load_error
+    if is_model_loaded: return grader
+    
+    try:
+        print("Checking AI Pipeline Models...")
+        from grading import Inference
+        config_args = SimpleNamespace(config='configs/prompts/video_demo.yaml')
+        grader = Inference(config=config_args.config)
+        print("AI Diffusion Models loaded successfully!")
+    except Exception as e:
+        print(f"Notice: Running in direct 3D LUT Color Transfer mode ({e})")
+        grader = None
+        model_load_error = e
+    finally:
+        is_model_loaded = True
+        
+    return grader
 
 @app.get("/api/library")
 async def get_library():
@@ -118,8 +130,10 @@ def run_grading_task(uid, ref_path, target_path, is_video, steps, size, ncc, out
             target_image = load_image_with_raw_support(target_path)
             target_thumb = np.array(Image.fromarray(target_image).resize((512, 512), Image.Resampling.LANCZOS))
             
-            if grader is not None:
-                grader(
+            active_grader = lazy_load_grader()
+            
+            if active_grader is not None:
+                active_grader(
                     ref_sequence=reference_image_np,
                     input_frames=[target_thumb],
                     return_frames=False,
@@ -159,8 +173,10 @@ def run_grading_task(uid, ref_path, target_path, is_video, steps, size, ncc, out
                 
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            if grader is not None:
-                grader(
+            active_grader = lazy_load_grader()
+            
+            if active_grader is not None:
+                active_grader(
                     ref_sequence=reference_image_np,
                     input_frames=[frame_rgb],
                     return_frames=False,
