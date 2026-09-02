@@ -1,10 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { UploadCloud, CheckCircle, Download, Film, Loader2 } from 'lucide-react';
+import { UploadCloud, CheckCircle, Download, Film, Loader2, Settings, ExternalLink } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 const API_BASE = '';
 
 function App() {
+  const [customApiUrl, setCustomApiUrl] = useState(() => localStorage.getItem('cinegrade_custom_api') || '');
   const [library, setLibrary] = useState([]);
   const [libraryError, setLibraryError] = useState(false);
   const [selectedRef, setSelectedRef] = useState(null);
@@ -17,20 +18,36 @@ function App() {
   const fileInputRef = useRef(null);
 
   useEffect(() => {
+    localStorage.setItem('cinegrade_custom_api', customApiUrl);
+    let isMounted = true;
+    let timeoutId;
+
     const fetchLibrary = async () => {
+      if (!isMounted) return;
       try {
-        const res = await fetch(`${API_BASE}/api/library`);
+        const baseUrl = customApiUrl.trim() || API_BASE;
+        const res = await fetch(`${baseUrl}/api/library`);
         if (!res.ok) throw new Error("Backend not ready");
         const data = await res.json();
-        setLibrary(data);
-        setLibraryError(false);
+        if (isMounted) {
+          setLibrary(data);
+          setLibraryError(false);
+        }
       } catch (err) {
-        setLibraryError(true);
-        setTimeout(fetchLibrary, 2000); // Retry every 2 seconds
+        if (isMounted) {
+          setLibraryError(true);
+          timeoutId = setTimeout(fetchLibrary, 2000); // Retry every 2 seconds
+        }
       }
     };
+    
     fetchLibrary();
-  }, []);
+    
+    return () => {
+      isMounted = false;
+      clearTimeout(timeoutId);
+    };
+  }, [customApiUrl]);
 
   const handleFileDrop = (e) => {
     e.preventDefault();
@@ -53,8 +70,9 @@ function App() {
     setResult(null);
 
     try {
+      const baseUrl = customApiUrl.trim() || API_BASE;
       // We need to fetch the reference image as a File object to send it
-      const refResponse = await fetch(`${API_BASE}${selectedRef.path}`);
+      const refResponse = await fetch(`${baseUrl}${selectedRef.path}`);
       const refBlob = await refResponse.blob();
       const refFile = new File([refBlob], selectedRef.name + '.jpg', { type: 'image/jpeg' });
 
@@ -65,7 +83,7 @@ function App() {
       formData.append('size', '512');
       formData.append('ncc', 'true');
 
-      const response = await fetch(`${API_BASE}/api/grade`, {
+      const response = await fetch(`${baseUrl}/api/grade`, {
         method: 'POST',
         body: formData,
       });
@@ -79,7 +97,7 @@ function App() {
       
       while (true) {
         await new Promise(resolve => setTimeout(resolve, 2000));
-        const statusRes = await fetch(`${API_BASE}/api/status/${taskId}`);
+        const statusRes = await fetch(`${baseUrl}/api/status/${taskId}`);
         if (!statusRes.ok) throw new Error(await statusRes.text());
         
         const statusData = await statusRes.json();
@@ -108,7 +126,47 @@ function App() {
       </header>
 
       {!result && (
-        <div className="layout-grid">
+        <>
+          <motion.div className="glass-panel" style={{ marginBottom: '40px' }} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '20px' }}>
+              <div>
+                <h3 style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', color: 'var(--accent-primary)' }}>
+                  <Settings size={20} />
+                  GPU Compute Configuration
+                </h3>
+                <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', maxWidth: '600px' }}>
+                  By default, processing runs locally. To offload compute to a free NVIDIA T4 GPU, launch the Colab notebook and paste the generated Cloudflare URL below.
+                </p>
+              </div>
+              
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', flex: '1', minWidth: '300px' }}>
+                <a 
+                  href="https://colab.research.google.com/github/shameel0505/VideoColorGrading/blob/main/CineGrade_Colab_Backend.ipynb" 
+                  target="_blank" 
+                  rel="noreferrer"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', background: '#25262b', padding: '10px 16px', borderRadius: '8px', textDecoration: 'none', color: '#fff', fontWeight: '500', width: 'fit-content', border: '1px solid rgba(255,255,255,0.1)', transition: 'all 0.2s ease' }}
+                  onMouseOver={(e) => { e.currentTarget.style.background = '#32343a'; e.currentTarget.style.borderColor = 'rgba(255,255,255,0.3)'; }}
+                  onMouseOut={(e) => { e.currentTarget.style.background = '#25262b'; e.currentTarget.style.borderColor = 'rgba(255,255,255,0.1)'; }}
+                >
+                  <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab" style={{ height: '20px' }}/>
+                  Launch Free GPU Backend
+                  <ExternalLink size={16} />
+                </a>
+                
+                <input 
+                  type="text" 
+                  placeholder="Paste Cloudflare URL here (e.g., https://xyz.trycloudflare.com)"
+                  value={customApiUrl}
+                  onChange={(e) => setCustomApiUrl(e.target.value)}
+                  style={{ width: '100%', padding: '12px 16px', borderRadius: '8px', background: 'rgba(0,0,0,0.3)', border: '1px solid var(--glass-border)', color: 'white', outline: 'none', fontFamily: 'monospace' }}
+                  onFocus={(e) => e.target.style.borderColor = 'var(--accent-primary)'}
+                  onBlur={(e) => e.target.style.borderColor = 'var(--glass-border)'}
+                />
+              </div>
+            </div>
+          </motion.div>
+
+          <div className="layout-grid" style={{ marginTop: 0 }}>
           <motion.div className="glass-panel" initial={{ opacity: 0, x: -20 }} animate={{ opacity: 1, x: 0 }}>
             <h3>1. Select Cinematic Look</h3>
             {library.length === 0 ? (
@@ -131,7 +189,7 @@ function App() {
                     className={`gallery-item ${selectedRef === item ? 'selected' : ''}`}
                     onClick={() => setSelectedRef(item)}
                   >
-                    <img src={`${API_BASE}${item.path}`} alt={item.name} />
+                    <img src={`${customApiUrl.trim() || API_BASE}${item.path}`} alt={item.name} />
                     <div className="palette-overlay">
                       <span style={{ fontSize: '12px', fontWeight: '600' }}>{item.name}</span>
                     </div>
@@ -196,7 +254,8 @@ function App() {
               )}
             </button>
           </motion.div>
-        </div>
+          </div>
+        </>
       )}
 
       {result && (
@@ -208,17 +267,17 @@ function App() {
           
           <div style={{ width: '100%', borderRadius: '12px', overflow: 'hidden', border: '1px solid var(--glass-border)', background: '#000' }}>
             {result.type === 'video' ? (
-              <video src={`${API_BASE}/api/download?path=${encodeURIComponent(result.output_media)}`} controls autoPlay loop style={{ width: '100%', display: 'block' }} />
+              <video src={`${customApiUrl.trim() || API_BASE}/api/download?path=${encodeURIComponent(result.output_media)}`} controls autoPlay loop style={{ width: '100%', display: 'block' }} />
             ) : (
-              <img src={`${API_BASE}/api/download?path=${encodeURIComponent(result.output_media)}`} alt="Graded result" style={{ width: '100%', display: 'block' }} />
+              <img src={`${customApiUrl.trim() || API_BASE}/api/download?path=${encodeURIComponent(result.output_media)}`} alt="Graded result" style={{ width: '100%', display: 'block' }} />
             )}
           </div>
 
           <div style={{ marginTop: '24px', display: 'flex', gap: '16px' }}>
-            <a href={`${API_BASE}/api/download?path=${encodeURIComponent(result.output_media)}`} download className="btn-primary" style={{ textDecoration: 'none', display: 'flex', justifyContent: 'center', gap: '8px' }}>
+            <a href={`${customApiUrl.trim() || API_BASE}/api/download?path=${encodeURIComponent(result.output_media)}`} download className="btn-primary" style={{ textDecoration: 'none', display: 'flex', justifyContent: 'center', gap: '8px' }}>
               <Download /> Download Media
             </a>
-            <a href={`${API_BASE}/api/download?path=${encodeURIComponent(result.output_lut)}`} download className="btn-primary" style={{ textDecoration: 'none', background: 'var(--bg-card-hover)', display: 'flex', justifyContent: 'center', gap: '8px' }}>
+            <a href={`${customApiUrl.trim() || API_BASE}/api/download?path=${encodeURIComponent(result.output_lut)}`} download className="btn-primary" style={{ textDecoration: 'none', background: 'var(--bg-card-hover)', display: 'flex', justifyContent: 'center', gap: '8px' }}>
               <Film /> Download 3D LUT (.cube)
             </a>
           </div>
