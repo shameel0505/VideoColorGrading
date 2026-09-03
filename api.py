@@ -470,6 +470,7 @@ def process_grading(
     background_tasks: BackgroundTasks,
     target: UploadFile = File(...),
     reference: Optional[UploadFile] = File(None),
+    ref_id: Optional[str] = Form(None),
     mode: str = Form("reference"), # "reference" or "auto"
     intensity: float = Form(1.0),
     protect_skin: bool = Form(True),
@@ -480,11 +481,21 @@ def process_grading(
     uid = uuid.uuid4().hex[:8]
     
     ref_path = None
-    if mode == "reference" and reference is not None:
-        ref_ext = os.path.splitext(reference.filename)[1].lower()
-        ref_path = os.path.join(tempfile.gettempdir(), f"ref_{uid}{ref_ext}")
-        with open(ref_path, "wb") as f:
-            shutil.copyfileobj(reference.file, f)
+    if mode == "reference":
+        if reference is not None and getattr(reference, 'filename', None):
+            ref_ext = os.path.splitext(reference.filename)[1].lower()
+            ref_path = os.path.join(tempfile.gettempdir(), f"ref_{uid}{ref_ext}")
+            with open(ref_path, "wb") as f:
+                shutil.copyfileobj(reference.file, f)
+        elif ref_id:
+            for ext in ['.jpg', '.jpeg', '.png']:
+                possible_path = os.path.join("cinematic_references", f"{ref_id}{ext}")
+                if os.path.exists(possible_path):
+                    ref_path = possible_path
+                    break
+        
+        if not ref_path:
+            raise HTTPException(status_code=400, detail="Reference image or valid ref_id is required.")
         
     target_ext = os.path.splitext(target.filename)[1].lower()
     target_path = os.path.join(tempfile.gettempdir(), f"target_{uid}{target_ext}")
