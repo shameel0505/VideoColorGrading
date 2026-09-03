@@ -1,5 +1,8 @@
 import os
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+# Enable CUDA memory allocation optimizations
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import cv2
 import numpy as np
 from PIL import Image
@@ -17,7 +20,32 @@ from fastapi.middleware.cors import CORSMiddleware
 import imageio_ffmpeg
 from pillow_lut import load_cube_file
 
+# Automatically select the best available device
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+    print(f"🚀 GPU detected: {torch.cuda.get_device_name(0)}")
+    print(f"💾 GPU VRAM: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+else:
+    DEVICE = torch.device("cpu")
+    print("⚠️ CUDA GPU not available — using CPU")
+
 torch.set_grad_enabled(False)
+
+def check_nvenc():
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        result = subprocess.run(
+            [ffmpeg_exe, "-hide_banner", "-encoders"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        return "h264_nvenc" in result.stdout
+    except Exception:
+        return False
+
+NVENC_AVAILABLE = check_nvenc()
+print("🎬 NVENC available" if NVENC_AVAILABLE else "⚠️ NVENC unavailable — video encoding will use CPU")
 
 app = FastAPI(title="CineGrade AI Pro Studio API")
 
@@ -44,6 +72,18 @@ def lazy_load_grader():
         from grading import Inference
         config_args = SimpleNamespace(config='configs/prompts/video_demo.yaml')
         grader = Inference(config=config_args.config)
+        
+        # Move PyTorch model components to GPU when possible
+        if DEVICE.type == "cuda":
+            try:
+                if hasattr(grader, "model"):
+                    grader.model = grader.model.to(DEVICE)
+                if hasattr(grader, "pipeline"):
+                    grader.pipeline = grader.pipeline.to(DEVICE)
+                print(f"🚀 AI grader moved to {DEVICE}")
+            except Exception as e:
+                print(f"⚠️ Could not explicitly move grader to GPU: {e}")
+
         print("AI Diffusion Models loaded successfully!")
     except Exception as e:
         print(f"Notice: Running in studio 3D LUT Color Transfer & Auto-Grader mode ({e})")
@@ -370,11 +410,19 @@ def run_grading_task(uid, ref_path, target_path, is_video, steps, size, ncc, out
             
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
             escaped_cube = output_cube.replace("\\", "/").replace(":", "\\:")
+            video_encoder = "h264_nvenc" if (
+                torch.cuda.is_available() and NVENC_AVAILABLE
+            ) else "libx264"
+
             ffmpeg_cmd = [
-                ffmpeg_exe, "-y", "-i", target_path,
+                ffmpeg_exe,
+                "-y",
+                "-i", target_path,
                 "-vf", f"lut3d={escaped_cube}",
                 "-c:a", "copy",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-c:v", video_encoder,
+                "-preset", "p4" if (torch.cuda.is_available() and NVENC_AVAILABLE) else "medium",
+                "-pix_fmt", "yuv420p",
                 output_mp4
             ]
             
@@ -398,12 +446,30 @@ def run_grading_task(uid, ref_path, target_path, is_video, steps, size, ncc, out
         traceback.print_exc()
         tasks[uid] = {"status": "error", "error": str(e)}
 
+@app.get("/api/gpu")
+def gpu_status():
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        return {
+            "cuda_available": True,
+            "device": "cuda",
+            "gpu_name": torch.cuda.get_device_name(0),
+            "vram_total_gb": round(props.total_memory / 1024**3, 2),
+            "vram_allocated_gb": round(torch.cuda.memory_allocated(0) / 1024**3, 2),
+            "vram_reserved_gb": round(torch.cuda.memory_reserved(0) / 1024**3, 2),
+            "nvenc_available": NVENC_AVAILABLE
+        }
+    return {
+        "cuda_available": False,
+        "device": "cpu",
+        "nvenc_available": False
+    }
+
 @app.post("/api/grade")
 def process_grading(
     background_tasks: BackgroundTasks,
     target: UploadFile = File(...),
     reference: Optional[UploadFile] = File(None),
-    ref_id: Optional[str] = Form(None),
     mode: str = Form("reference"), # "reference" or "auto"
     intensity: float = Form(1.0),
     protect_skin: bool = Form(True),
@@ -414,29 +480,11 @@ def process_grading(
     uid = uuid.uuid4().hex[:8]
     
     ref_path = None
-    if mode == "reference":
-        if reference is not None:
-            ref_ext = os.path.splitext(reference.filename)[1].lower()
-            ref_path = os.path.join(tempfile.gettempdir(), f"ref_{uid}{ref_ext}")
-            with open(ref_path, "wb") as f:
-                shutil.copyfileobj(reference.file, f)
-        elif ref_id:
-            # Directly load server-side reference image from library
-            ref_dir = "cinematic_references"
-            for ext in ['.jpg', '.jpeg', '.png']:
-                potential = os.path.join(ref_dir, f"{ref_id}{ext}")
-                if os.path.exists(potential):
-                    ref_path = potential
-                    break
-            if not ref_path:
-                # Try finding by name prefix
-                for fname in os.listdir(ref_dir):
-                    if fname.startswith(ref_id):
-                        ref_path = os.path.join(ref_dir, fname)
-                        break
-        
-        if not ref_path and mode == "reference":
-            raise HTTPException(status_code=400, detail="Reference image or valid ref_id is required.")
+    if mode == "reference" and reference is not None:
+        ref_ext = os.path.splitext(reference.filename)[1].lower()
+        ref_path = os.path.join(tempfile.gettempdir(), f"ref_{uid}{ref_ext}")
+        with open(ref_path, "wb") as f:
+            shutil.copyfileobj(reference.file, f)
         
     target_ext = os.path.splitext(target.filename)[1].lower()
     target_path = os.path.join(tempfile.gettempdir(), f"target_{uid}{target_ext}")

@@ -41,7 +41,7 @@ class Inference():
 
         ### >>> create diffusion pipeline >>> ###
         vae = AutoencoderKL.from_pretrained(config.pretrained_sd_path, subfolder="vae", torch_dtype=weight_dtype, low_cpu_mem_usage=True)
-        self.clip_image_encoder = ImageEncoder(model_path=config.pretrained_clip_path).to(dtype=weight_dtype)
+        self.clip_image_encoder = ImageEncoder(model_path=config.pretrained_clip_path).to(dtype=weight_dtype, device=device)
         self.clip_image_processor = CLIPProcessor.from_pretrained(config.pretrained_clip_path, local_files_only=True)
 
         unet = UNet2DConditionModel.from_pretrained(config.pretrained_sd_path, subfolder="unet", in_channels=6, out_channels=3, low_cpu_mem_usage=False, ignore_mismatched_sizes=True, torch_dtype=weight_dtype)
@@ -59,6 +59,7 @@ class Inference():
         self.referencenet = ReferenceNet.from_pretrained(config.pretrained_sd_path, subfolder="unet", torch_dtype=weight_dtype, low_cpu_mem_usage=True)
         state_dict = torch.load(config.pretrained_GE_path, map_location="cpu")["referencenet_state_dict"]
         m, u = self.referencenet.load_state_dict(state_dict, strict=True)
+        self.referencenet = self.referencenet.to(device, dtype=weight_dtype)
         del state_dict
         gc.collect()
         if device == 'mps': torch.mps.empty_cache()
