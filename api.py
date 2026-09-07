@@ -191,9 +191,6 @@ def compute_skin_mask(rgb_np):
 
 def generate_pro_reference_lut(ref_np, target_np, output_cube_path, lut_size=33, intensity=1.0, protect_skin=True):
     """
-    State-of-the-Art Pro Colorist Reference Grading Engine:
-def generate_pro_reference_lut(ref_np, target_np, output_cube_path, lut_size=33, intensity=1.0, protect_skin=True):
-    """
     Studio-Grade Cinematic Reference Matcher:
     - Anchored dynamic range (clean blacks, protected highlights, smooth film midtones)
     - Monotonic smooth luminance transfer
