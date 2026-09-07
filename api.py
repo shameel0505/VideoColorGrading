@@ -540,11 +540,11 @@ def run_grading_task(uid, ref_path, target_path, is_video, steps, size, ncc, out
                     frame_rgb = None
             
             if frame_rgb is None:
-                # Extract embedded poster frame from BRAW / R3D / ARI headers
-                frame_rgb = extract_embedded_jpeg_from_raw(target_path)
-                
-            if frame_rgb is None:
-                raise Exception("Could not extract a representative frame from the cinema/video footage.")
+                ext = target_ext.lower()
+                if ext in ['.braw', '.r3d', '.ari']:
+                    raise Exception(f"{ext.upper()} is a proprietary cinema RAW video format that requires sensor debayering. Please export a still (PNG, JPG, TIFF) or ProRes/MP4 clip from DaVinci Resolve or Premiere, drop it into CineGrade to generate your custom .CUBE 3D LUT, and apply the LUT to your raw timeline.")
+                else:
+                    raise Exception("Could not extract a representative frame from the video footage.")
             
             if mode == "auto":
                 generate_auto_grade_lut(frame_rgb, output_cube, intensity=intensity, style=style)
