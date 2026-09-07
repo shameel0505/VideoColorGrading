@@ -431,6 +431,49 @@ def generate_auto_grade_lut(target_np, output_cube_path, lut_size=33, intensity=
         a_graded = (a - 0.012 * sh_w) * 0.88
         b_graded = (b - 0.015 * sh_w) * 0.88
         
+    elif style == "cinestill":
+        # CineStill 800T: Iconic tungsten night look, deep cobalt shadows, glowing warm tungsten highlights
+        L_target = L_curved * 0.80 + L_norm * 0.20
+        L_target = L_target * (1.0 - 0.32 * (C ** 1.2))
+        
+        sh_w = np.clip((0.38 - L_target) / 0.38, 0.0, 1.0) ** 1.5
+        hi_w = np.clip((L_target - 0.48) / 0.52, 0.0, 1.0) ** 1.5
+        
+        a_graded = a - 0.012 * sh_w + 0.022 * hi_w
+        b_graded = b - 0.038 * sh_w + 0.040 * hi_w
+
+    elif style == "kodachrome":
+        # Kodak Kodachrome 64: Vintage 1970s National Geographic, rich punchy contrast, saturated primary reds & greens
+        L_target = L_curved * 0.90 + L_norm * 0.10
+        L_target = L_target * (1.0 - 0.26 * (C ** 1.2))
+        
+        hi_w = np.clip((L_target - 0.55) / 0.45, 0.0, 1.0) ** 1.4
+        sh_w = np.clip((0.35 - L_target) / 0.35, 0.0, 1.0) ** 1.4
+        
+        a_graded = a * 1.18 + 0.008 * hi_w
+        b_graded = b * 1.14 - 0.006 * sh_w
+
+    elif style == "fuji_pro":
+        # Fujifilm Pro 400H: Soft pastel editorial, airy mint greens, cyan skies, luminous creamy highlights
+        L_target = L_curved * 0.55 + L_norm * 0.45 + 0.025 # Airy midtone lift
+        L_target = L_target * (1.0 - 0.20 * (C ** 1.2))
+        
+        hi_w = np.clip((L_target - 0.50) / 0.50, 0.0, 1.0) ** 1.5
+        sh_w = np.clip((0.40 - L_target) / 0.40, 0.0, 1.0) ** 1.5
+        
+        a_graded = a * 0.92 - 0.012 * hi_w - 0.006 * sh_w
+        b_graded = b * 0.94 - 0.015 * hi_w + 0.004 * sh_w
+
+    elif style == "bleach_bypass":
+        # Bleach Bypass (Silver Retention): High local contrast, desaturated silver tones, gritty action thriller
+        L_target = np.clip(L_curved * 1.05 - 0.02, 0.0, 1.0)
+        L_target = L_target * (1.0 - 0.15 * (C ** 1.2))
+        
+        sh_w = np.clip((0.40 - L_target) / 0.40, 0.0, 1.0) ** 1.5
+        
+        a_graded = (a - 0.006 * sh_w) * 0.50 # Heavy desaturation
+        b_graded = (b - 0.008 * sh_w) * 0.50
+
     else: # "commercial" / "clean"
         # Clean Commercial 35mm: Vivid memory colors, punchy broadcast dynamic range
         L_target = L_curved * 0.50 + L_norm * 0.50
