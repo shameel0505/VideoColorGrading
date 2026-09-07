@@ -566,14 +566,15 @@ def run_grading_task(uid, ref_path, target_path, is_video, steps, size, ncc, out
             output_mp4 = os.path.join(tempfile.gettempdir(), f"graded_output_{uid}.mp4")
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
             
-            # Robust frame extraction (handles 4K/8K, HEVC, ProRes, BRAW, R3D, MKV, VFR)
+            # Robust multi-strategy frame extraction (handles short clips, 4K/8K, HEVC, ProRes, MKV, VFR)
             frame_rgb = None
             frame_jpg = os.path.join(tempfile.gettempdir(), f"frame_{uid}.jpg")
+            
+            # Strategy 1: Direct first-frame extraction
             try:
                 cmd = [
                     ffmpeg_exe,
                     "-y",
-                    "-ss", "00:00:01",
                     "-i", target_path,
                     "-vframes", "1",
                     "-q:v", "2",
@@ -589,12 +590,40 @@ def run_grading_task(uid, ref_path, target_path, is_video, steps, size, ncc, out
             except Exception:
                 frame_rgb = None
                 
+            # Strategy 2: Fast seek extraction (for long videos)
+            if frame_rgb is None:
+                try:
+                    cmd = [
+                        ffmpeg_exe,
+                        "-y",
+                        "-ss", "0.5",
+                        "-i", target_path,
+                        "-vframes", "1",
+                        "-q:v", "2",
+                        frame_jpg
+                    ]
+                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=20)
+                    if os.path.exists(frame_jpg) and os.path.getsize(frame_jpg) > 0:
+                        frame_rgb = np.array(Image.open(frame_jpg).convert('RGB'))
+                        try:
+                            os.remove(frame_jpg)
+                        except Exception:
+                            pass
+                except Exception:
+                    frame_rgb = None
+
+            # Strategy 3: PyAV / imageio reader
+            if frame_rgb is None:
+                try:
+                    import imageio.v3 as iio
+                    frame_rgb = iio.imread(target_path, index=0)
+                except Exception:
+                    frame_rgb = None
+
+            # Strategy 4: OpenCV VideoCapture fallback
             if frame_rgb is None:
                 try:
                     cap = cv2.VideoCapture(target_path)
-                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                    if total_frames > 1:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, total_frames // 2))
                     ret, frame = cap.read()
                     cap.release()
                     if ret and frame is not None:
