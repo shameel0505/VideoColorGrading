@@ -1,0 +1,13 @@
+fastapi>=0.100.0
+uvicorn[standard]>=0.23.0
+python-multipart>=0.0.6
+pillow>=10.0.0
+pillow-lut>=1.0.3
+numpy>=1.24.0
+opencv-python-headless>=4.8.0
+imageio-ffmpeg>=0.4.9
+scipy>=1.11.0
+rawpy>=0.19.0
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+torchvision
