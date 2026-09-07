@@ -161,74 +161,132 @@ async def serve_library_image(filename: str):
 
 tasks = {}
 
+# ==============================================================================
+# 🎨 Studio-Grade Oklab & Subtractive Film Color Science Engine
+# ==============================================================================
+
+# Forward & Inverse Matrices for Linear sRGB <-> Oklab (Björn Ottosson, 2020)
+_OKLAB_M1 = np.array([
+    [0.4122214708, 0.5363325363, 0.0514459929],
+    [0.2119034982, 0.6806995451, 0.1073969566],
+    [0.0883024619, 0.2817188376, 0.6299787005]
+], dtype=np.float32)
+
+_OKLAB_M2 = np.array([
+    [0.2104542553, 0.7936177850, -0.0040720468],
+    [1.9779984951, -2.4285922050, 0.4505937099],
+    [0.0259040371, 0.7827717662, -0.8086757660]
+], dtype=np.float32)
+
+_OKLAB_M2_INV = np.linalg.inv(_OKLAB_M2).astype(np.float32)
+_OKLAB_M1_INV = np.linalg.inv(_OKLAB_M1).astype(np.float32)
+
+def srgb_to_linear(rgb):
+    rgb = np.clip(rgb, 0.0, 1.0)
+    mask = rgb <= 0.04045
+    linear = np.empty_like(rgb)
+    linear[mask] = rgb[mask] / 12.92
+    linear[~mask] = np.power((rgb[~mask] + 0.055) / 1.055, 2.4)
+    return linear
+
+def linear_to_srgb(linear):
+    linear = np.clip(linear, 0.0, 1.0)
+    mask = linear <= 0.0031308
+    srgb = np.empty_like(linear)
+    srgb[mask] = 12.92 * linear[mask]
+    srgb[~mask] = 1.055 * np.power(np.maximum(linear[~mask], 0.0), 1.0 / 2.4) - 0.055
+    return np.clip(srgb, 0.0, 1.0)
+
+def rgb_to_oklab(rgb):
+    lin = srgb_to_linear(rgb)
+    shape = lin.shape
+    lin_flat = lin.reshape(-1, 3)
+    lms = lin_flat @ _OKLAB_M1.T
+    lms = np.maximum(lms, 0.0)
+    lms_prime = np.cbrt(lms)
+    oklab = lms_prime @ _OKLAB_M2.T
+    return oklab.reshape(shape)
+
+def oklab_to_rgb(oklab):
+    shape = oklab.shape
+    oklab_flat = oklab.reshape(-1, 3)
+    lms_prime = oklab_flat @ _OKLAB_M2_INV.T
+    lms = np.maximum(lms_prime, 0.0) ** 3
+    lin = lms @ _OKLAB_M1_INV.T
+    lin = np.clip(lin, 0.0, 1.0)
+    srgb = linear_to_srgb(lin.reshape(shape))
+    return srgb
+
+def compute_oklab_skin_mask(oklab):
+    """Calculates continuous Melanin Skin Tone probability in Oklab space."""
+    L = oklab[:, 0]
+    a = oklab[:, 1]
+    b = oklab[:, 2]
+    
+    chroma = np.sqrt(a**2 + b**2)
+    hue = np.arctan2(b, a) # Hue angle in radians
+    
+    # Human melanin skin locus in Oklab: ~0.95 rad (~54 degrees)
+    hue_center = 0.95
+    hue_width = 0.35
+    hue_weight = np.clip(1.0 - (np.abs(hue - hue_center) / hue_width)**2, 0.0, 1.0)
+    
+    chroma_weight = np.clip((chroma - 0.03) / 0.05, 0.0, 1.0) * np.clip((0.20 - chroma) / 0.06, 0.0, 1.0)
+    lightness_weight = np.clip((L - 0.20) / 0.15, 0.0, 1.0) * np.clip((0.88 - L) / 0.15, 0.0, 1.0)
+    
+    return np.clip(hue_weight * chroma_weight * lightness_weight, 0.0, 1.0)
+
 def compute_skin_mask_vectorized(rgb_flt):
-    """
-    Vectorized high-precision skin locus probability computation.
-    rgb_flt: (N, 3) float in [0, 1]
-    returns: (N,) skin probability in [0, 1]
-    """
-    rgb_u8 = np.clip(rgb_flt * 255.0, 0, 255).astype(np.uint8).reshape(-1, 1, 3)
-    ycrcb = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2YCrCb).reshape(-1, 3).astype(np.float32)
-    y = ycrcb[:, 0] / 255.0
-    cr = ycrcb[:, 1]
-    cb = ycrcb[:, 2]
-    
-    # Human skin tone locus on I-line: center ~ 152 Cr, 110 Cb
-    d_cr = (cr - 152.0) / 18.0
-    d_cb = (cb - 110.0) / 15.0
-    dist_sq = d_cr**2 + d_cb**2
-    skin_prob = np.exp(-0.5 * dist_sq)
-    
-    # Luminance gating to exclude deep blacks and blown whites
-    lum_gate = np.clip((y - 0.12) / 0.12, 0.0, 1.0) * np.clip((0.92 - y) / 0.12, 0.0, 1.0)
-    return np.clip(skin_prob * lum_gate, 0.0, 1.0)
+    oklab = rgb_to_oklab(rgb_flt)
+    return compute_oklab_skin_mask(oklab)
 
 def compute_skin_mask(rgb_np):
-    """Generates a soft probability mask (0.0 to 1.0) of human skin tones for image arrays."""
     h, w, c = rgb_np.shape
     flt = (rgb_np.reshape(-1, 3).astype(np.float32) / 255.0)
     return compute_skin_mask_vectorized(flt).reshape(h, w)
 
 def generate_pro_reference_lut(ref_np, target_np, output_cube_path, lut_size=33, intensity=1.0, protect_skin=True):
     """
-    Studio-Grade Cinematic Reference Matcher:
-    - Anchored dynamic range (clean blacks, protected highlights, smooth film midtones)
-    - Monotonic smooth luminance transfer
-    - Organic Split-Toning chromatic alignment based on reference shadow/mid/highlight palettes
-    - Vectorized Skin Tone Line protection
+    Studio-Grade Cinematic Reference Matcher in Oklab:
+    - Monotonic Luminance Transfer with Boundary Anchors (no crushing, no clipping)
+    - Subtractive Color Density (CMY film light absorption)
+    - Zone-aware smooth chromatic translation (Shadows, Midtones, Highlights)
+    - Melanin Skin Tone Lock
     """
-    ref_lab = cv2.cvtColor(ref_np, cv2.COLOR_RGB2LAB).astype(np.float32)
-    tgt_lab = cv2.cvtColor(target_np, cv2.COLOR_RGB2LAB).astype(np.float32)
+    ref_rgb = ref_np.astype(np.float32) / 255.0
+    tgt_rgb = target_np.astype(np.float32) / 255.0
     
-    ref_l = ref_lab[:, :, 0].flatten()
-    tgt_l = tgt_lab[:, :, 0].flatten()
+    ref_oklab = rgb_to_oklab(ref_rgb)
+    tgt_oklab = rgb_to_oklab(tgt_rgb)
     
-    # 1. Luminance Quantile Transfer with Zero & Max Anchors
+    ref_l = ref_oklab[:, :, 0].flatten()
+    tgt_l = tgt_oklab[:, :, 0].flatten()
+    
+    # 1. Monotonic Luminance Quantile Matching
     quantiles = np.linspace(0, 100, 101)
     tgt_l_q = np.percentile(tgt_l, quantiles)
     ref_l_q = np.percentile(ref_l, quantiles)
     
-    # Ensure strict monotonicity and boundary anchors
-    tgt_l_q = np.concatenate([[0.0], tgt_l_q, [255.0]])
-    ref_l_q = np.concatenate([[0.0], ref_l_q, [255.0]])
+    tgt_l_q = np.concatenate([[0.0], tgt_l_q, [1.0]])
+    ref_l_q = np.concatenate([[0.0], ref_l_q, [1.0]])
     
-    tgt_l_q_unique, unique_indices = np.unique(tgt_l_q, return_index=True)
-    ref_l_q_unique = ref_l_q[unique_indices]
+    tgt_l_q_u, u_idx = np.unique(tgt_l_q, return_index=True)
+    ref_l_q_u = ref_l_q[u_idx]
     
-    # 2. Extract Reference Chromatic Tones by Luminance Zone
-    l_ref_2d = ref_lab[:, :, 0]
-    shadow_mask = l_ref_2d < 80
-    high_mask = l_ref_2d > 175
-    mid_mask = (~shadow_mask) & (~high_mask)
+    # 2. Extract Zone-based Reference Chromatic Palette in Oklab
+    ref_l_2d = ref_oklab[:, :, 0]
+    sh_mask = ref_l_2d < 0.35
+    hi_mask = ref_l_2d > 0.65
+    mid_mask = (~sh_mask) & (~hi_mask)
     
-    ref_ab_shadow = np.median(ref_lab[shadow_mask, 1:3], axis=0) if np.sum(shadow_mask) > 50 else np.array([128.0, 128.0], dtype=np.float32)
-    ref_ab_mid = np.median(ref_lab[mid_mask, 1:3], axis=0) if np.sum(mid_mask) > 50 else np.array([128.0, 128.0], dtype=np.float32)
-    ref_ab_high = np.median(ref_lab[high_mask, 1:3], axis=0) if np.sum(high_mask) > 50 else np.array([128.0, 128.0], dtype=np.float32)
+    ref_ab_sh = np.median(ref_oklab[sh_mask, 1:3], axis=0) if np.sum(sh_mask) > 50 else np.array([0.0, 0.0], dtype=np.float32)
+    ref_ab_mid = np.median(ref_oklab[mid_mask, 1:3], axis=0) if np.sum(mid_mask) > 50 else np.array([0.0, 0.0], dtype=np.float32)
+    ref_ab_hi = np.median(ref_oklab[hi_mask, 1:3], axis=0) if np.sum(hi_mask) > 50 else np.array([0.0, 0.0], dtype=np.float32)
     
-    # Calculate gentle chromatic offsets from neutral 128
-    d_shadow = (ref_ab_shadow - 128.0) * 0.45
-    d_mid = (ref_ab_mid - 128.0) * 0.35
-    d_high = (ref_ab_high - 128.0) * 0.40
+    # Chromatic dispersion
+    ref_chroma_std = np.std(np.sqrt(ref_oklab[:, :, 1]**2 + ref_oklab[:, :, 2]**2)) + 1e-5
+    tgt_chroma_std = np.std(np.sqrt(tgt_oklab[:, :, 1]**2 + tgt_oklab[:, :, 2]**2)) + 1e-5
+    chroma_scale = np.clip(ref_chroma_std / tgt_chroma_std, 0.7, 1.4)
     
     # 3. Build 3D LUT lattice
     b_vals = np.linspace(0, 1, lut_size, dtype=np.float32)
@@ -238,140 +296,163 @@ def generate_pro_reference_lut(ref_np, target_np, output_cube_path, lut_size=33,
     B, G, R = np.meshgrid(b_vals, g_vals, r_vals, indexing='ij')
     rgb_lattice = np.stack([R, G, B], axis=-1).reshape(-1, 3)
     
-    rgb_lattice_u8 = (rgb_lattice * 255.0).astype(np.uint8).reshape(-1, 1, 3)
-    lab_lattice = cv2.cvtColor(rgb_lattice_u8, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
+    oklab_lattice = rgb_to_oklab(rgb_lattice)
+    orig_l = oklab_lattice[:, 0]
     
-    # Smooth luminance transfer
-    orig_l = lab_lattice[:, 0]
-    matched_l = np.interp(orig_l, tgt_l_q_unique, ref_l_q_unique)
+    matched_l = np.interp(orig_l, tgt_l_q_u, ref_l_q_u)
     graded_l = orig_l * 0.35 + matched_l * 0.65
-    lab_lattice[:, 0] = np.clip(graded_l, 0.0, 255.0)
     
-    # Smooth zone weights for chromatic split-toning
-    norm_l = lab_lattice[:, 0] / 255.0
-    w_shadow = np.clip((0.40 - norm_l) / 0.35, 0.0, 1.0) ** 1.8
-    w_high = np.clip((norm_l - 0.60) / 0.35, 0.0, 1.0) ** 1.8
-    w_mid = np.maximum(0.0, 1.0 - w_shadow - w_high)
-    tot = w_shadow + w_mid + w_high + 1e-6
-    w_shadow /= tot
+    # Zone weights for smooth transitions
+    w_sh = np.clip((0.38 - graded_l) / 0.35, 0.0, 1.0) ** 1.6
+    w_hi = np.clip((graded_l - 0.55) / 0.35, 0.0, 1.0) ** 1.6
+    w_mid = np.maximum(0.0, 1.0 - w_sh - w_hi)
+    tot = w_sh + w_mid + w_hi + 1e-6
+    w_sh /= tot
     w_mid /= tot
-    w_high /= tot
+    w_hi /= tot
     
-    chroma_shift = (
-        w_shadow[:, None] * d_shadow +
-        w_mid[:, None] * d_mid +
-        w_high[:, None] * d_high
-    )
+    target_ab = w_sh[:, None] * ref_ab_sh + w_mid[:, None] * ref_ab_mid + w_hi[:, None] * ref_ab_hi
     
-    # Apply chromatic shift with smooth saturation gating
-    current_ab = lab_lattice[:, 1:3]
-    lab_lattice[:, 1:3] = np.clip(current_ab + chroma_shift, 0.0, 255.0)
+    # Chromatic blend in Oklab
+    graded_a = oklab_lattice[:, 1] * chroma_scale * 0.60 + target_ab[:, 0] * 0.40
+    graded_b = oklab_lattice[:, 2] * chroma_scale * 0.60 + target_ab[:, 1] * 0.40
     
-    lab_lattice_u8 = np.clip(lab_lattice, 0, 255).astype(np.uint8).reshape(-1, 1, 3)
-    graded_rgb = cv2.cvtColor(lab_lattice_u8, cv2.COLOR_LAB2RGB).reshape(-1, 3).astype(np.float32) / 255.0
+    # Subtractive Color Density (more saturated = deeper light absorption)
+    C = np.sqrt(graded_a**2 + graded_b**2)
+    graded_l = graded_l * (1.0 - 0.25 * (C ** 1.2))
     
-    # Skin tone protection
+    # Parabolic Highlight Roll-Off (prevents any digital clipping)
+    graded_l = np.where(graded_l > 0.88, 0.88 + 0.12 * (1.0 - np.exp(-(graded_l - 0.88) / 0.12)), graded_l)
+    graded_l = np.clip(graded_l, 0.0, 1.0)
+    
+    graded_oklab = np.stack([graded_l, graded_a, graded_b], axis=-1)
+    
+    # Melanin Skin Protection
     if protect_skin:
-        skin_probs = compute_skin_mask_vectorized(rgb_lattice)
-        blend_mask = (skin_probs * 0.85)[:, None]
-        graded_rgb = graded_rgb * (1.0 - blend_mask) + rgb_lattice * blend_mask
+        skin_probs = compute_oklab_skin_mask(oklab_lattice)
+        blend_mask = (skin_probs * 0.80)[:, None]
+        skin_natural = np.stack([orig_l * 0.50 + graded_l * 0.50, oklab_lattice[:, 1] * 1.02, oklab_lattice[:, 2] * 1.04], axis=-1)
+        graded_oklab = graded_oklab * (1.0 - blend_mask) + skin_natural * blend_mask
         
+    graded_rgb = oklab_to_rgb(graded_oklab)
+    
+    # Anchored clean pure black & white
+    graded_rgb[0] = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    graded_rgb[-1] = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+    
     final_rgb = rgb_lattice * (1.0 - intensity) + graded_rgb * intensity
     final_rgb = np.clip(final_rgb, 0.0, 1.0)
     
     with open(output_cube_path, 'w') as f:
-        f.write('TITLE "CineGrade Pro Cinematic Reference LUT"\n')
+        f.write('TITLE "CineGrade Pro Oklab Reference Matcher"\n')
         f.write(f'LUT_3D_SIZE {lut_size}\n')
         f.write('DOMAIN_MIN 0.0 0.0 0.0\n')
         f.write('DOMAIN_MAX 1.0 1.0 1.0\n\n')
         for i in range(len(final_rgb)):
             f.write(f'{final_rgb[i, 0]:.6f} {final_rgb[i, 1]:.6f} {final_rgb[i, 2]:.6f}\n')
 
-def generate_auto_grade_lut(target_np, output_cube_path, lut_size=33, intensity=1.0, style="blockbuster"):
+def generate_auto_grade_lut(target_np, output_cube_path, lut_size=33, intensity=1.0, style="vision3", is_log=False):
     """
-    Hollywood Film Print Emulation Engine (Kodak 2383 / Fuji 3513 inspired):
-    - Filmic S-curve with soft toe and gentle highlight shoulder roll-off
-    - Signature cinema split-toning (Teal/Orange, Golden Hour, Noir, Clean)
-    - Melanin skin-tone locus protection
-    - Anchored blacks and whites for clean broadcast compliance
+    Photographic Master Film Stock Emulation Engine (Oklab + Subtractive CMY Density):
+    - 'vision3' / 'blockbuster': Kodak Vision3 500T (Hollywood Teal & Gold)
+    - 'portra' / 'golden_hour': Kodak Portra 400 (Warm & Luminous Skin)
+    - 'eterna' / 'noir': Fuji Eterna 8543 (Muted Film Noir)
+    - 'commercial' / 'clean': Clean Commercial 35mm (Crisp & Vibrant)
     """
     b_vals = np.linspace(0, 1, lut_size, dtype=np.float32)
     g_vals = np.linspace(0, 1, lut_size, dtype=np.float32)
     r_vals = np.linspace(0, 1, lut_size, dtype=np.float32)
     
     B, G, R = np.meshgrid(b_vals, g_vals, r_vals, indexing='ij')
-    rgb = np.stack([R, G, B], axis=-1).reshape(-1, 3) # Shape: (N, 3)
+    rgb_lattice = np.stack([R, G, B], axis=-1).reshape(-1, 3)
     
-    # 1. Kodak 2383 Filmic Tone Curve (Smooth S-Curve with protected highlights)
-    x = rgb
-    # Filmic curve function
-    gamma_boost = 1.08
-    x_g = np.power(x, gamma_boost)
-    filmic = (x_g * (2.45 * x_g + 0.05)) / (x_g * (2.40 * x_g + 0.60) + 0.12)
-    filmic = np.clip(filmic, 0.0, 1.0)
+    rgb_in = rgb_lattice.copy()
+    if is_log:
+        rgb_in = np.power(np.maximum(rgb_in - 0.05, 0.0) / 0.90, 1.45)
+        rgb_in = np.clip(rgb_in, 0.0, 1.0)
+        
+    oklab = rgb_to_oklab(rgb_in)
+    L = oklab[:, 0]
+    a = oklab[:, 1]
+    b = oklab[:, 2]
     
-    # 2. Style-Specific Split-Toning & Chromatic Personality
-    lum = 0.2126 * filmic[:, 0] + 0.7152 * filmic[:, 1] + 0.0722 * filmic[:, 2]
+    # Authentic Film Toe & S-Curve
+    L_norm = np.clip(L, 0.0, 1.0)
+    L_curved = (L_norm * (2.35 * L_norm + 0.04)) / (L_norm * (2.25 * L_norm + 0.65) + 0.10)
+    L_curved = np.clip(L_curved, 0.0, 1.0)
     
-    if style == "golden_hour":
-        # Warm golden highlight glow with rich amber midtones & soft film shadows
-        s_curve = filmic * 0.75 + x * 0.25
-        sh_w = np.clip((0.45 - lum) / 0.45, 0.0, 1.0)[:, None] ** 1.5
-        hi_w = np.clip((lum - 0.40) / 0.60, 0.0, 1.0)[:, None] ** 1.5
-        sh_tint = np.array([0.03, 0.015, -0.04], dtype=np.float32)
-        hi_tint = np.array([0.09, 0.04, -0.07], dtype=np.float32)
-        vib_boost = 0.18
-    elif style == "noir":
-        # Moody high-contrast with cool slate shadows and muted film tones
-        s_curve = filmic * 0.90 + x * 0.10
-        sh_w = np.clip((0.50 - lum) / 0.50, 0.0, 1.0)[:, None] ** 1.5
-        hi_w = np.clip((lum - 0.55) / 0.45, 0.0, 1.0)[:, None] ** 1.5
-        sh_tint = np.array([-0.04, -0.01, 0.05], dtype=np.float32)
-        hi_tint = np.array([0.01, 0.01, -0.01], dtype=np.float32)
-        vib_boost = -0.15
-    elif style == "clean":
-        # Crisp true-to-life broadcast color with extended dynamic range
-        s_curve = filmic * 0.50 + x * 0.50
-        sh_w = np.clip((0.35 - lum) / 0.35, 0.0, 1.0)[:, None] ** 1.5
-        hi_w = np.clip((lum - 0.65) / 0.35, 0.0, 1.0)[:, None] ** 1.5
-        sh_tint = np.array([-0.01, 0.01, 0.02], dtype=np.float32)
-        hi_tint = np.array([0.01, 0.01, -0.01], dtype=np.float32)
-        vib_boost = 0.22
-    else: # "blockbuster" Hollywood standard
-        # Hollywood Teal & Orange complementary contrast
-        s_curve = filmic * 0.70 + x * 0.30
-        sh_w = np.clip((0.45 - lum) / 0.45, 0.0, 1.0)[:, None] ** 1.6
-        hi_w = np.clip((lum - 0.50) / 0.50, 0.0, 1.0)[:, None] ** 1.6
-        # Rich teal in shadows, warm golden peach in highlights
-        sh_tint = np.array([-0.05, 0.02, 0.07], dtype=np.float32)
-        hi_tint = np.array([0.06, 0.025, -0.04], dtype=np.float32)
-        vib_boost = 0.20
+    C = np.sqrt(a**2 + b**2)
     
-    graded = s_curve + sh_w * sh_tint + hi_w * hi_tint
-    graded = np.clip(graded, 0.0, 1.0)
+    if style in ["vision3", "blockbuster"]:
+        # Kodak Vision3 500T 5219: Deep oceanic teal in shadows, warm golden highlights
+        L_target = L_curved * 0.75 + L_norm * 0.25
+        L_target = L_target * (1.0 - 0.30 * (C ** 1.2)) # Subtractive density
+        
+        sh_w = np.clip((0.40 - L_target) / 0.40, 0.0, 1.0) ** 1.6
+        hi_w = np.clip((L_target - 0.50) / 0.50, 0.0, 1.0) ** 1.6
+        
+        a_graded = a - 0.018 * sh_w + 0.016 * hi_w
+        b_graded = b - 0.030 * sh_w + 0.032 * hi_w
+        
+    elif style in ["portra", "golden_hour"]:
+        # Kodak Portra 400: Luminous warm midtones, gentle shadow lift, flattering complexion
+        L_target = L_curved * 0.60 + L_norm * 0.40
+        L_target = L_target + 0.02 * np.clip((0.30 - L_target) / 0.30, 0.0, 1.0) # Shadow lift
+        L_target = L_target * (1.0 - 0.22 * (C ** 1.2))
+        
+        hi_w = np.clip((L_target - 0.45) / 0.55, 0.0, 1.0) ** 1.5
+        sh_w = np.clip((0.35 - L_target) / 0.35, 0.0, 1.0) ** 1.5
+        
+        a_graded = a + 0.012 * hi_w + 0.005 * sh_w
+        b_graded = b + 0.028 * hi_w - 0.010 * sh_w
+        
+    elif style in ["eterna", "noir"]:
+        # Fuji Eterna 8543: Cool slate shadows, restrained saturation, moody Nordic contrast
+        L_target = L_curved * 0.85 + L_norm * 0.15
+        L_target = L_target * (1.0 - 0.25 * (C ** 1.2))
+        
+        sh_w = np.clip((0.45 - L_target) / 0.45, 0.0, 1.0) ** 1.5
+        hi_w = np.clip((L_target - 0.55) / 0.45, 0.0, 1.0) ** 1.5
+        
+        a_graded = (a - 0.012 * sh_w) * 0.88
+        b_graded = (b - 0.015 * sh_w) * 0.88
+        
+    else: # "commercial" / "clean"
+        # Clean Commercial 35mm: Vivid memory colors, punchy broadcast dynamic range
+        L_target = L_curved * 0.50 + L_norm * 0.50
+        L_target = L_target * (1.0 - 0.28 * (C ** 1.2))
+        
+        hi_w = np.clip((L_target - 0.60) / 0.40, 0.0, 1.0) ** 1.5
+        sh_w = np.clip((0.35 - L_target) / 0.35, 0.0, 1.0) ** 1.5
+        
+        a_graded = a * 1.10 + 0.006 * hi_w
+        b_graded = b * 1.10 - 0.008 * sh_w
+        
+    # Parabolic Highlight Roll-Off
+    L_target = np.where(L_target > 0.85, 0.85 + 0.15 * (1.0 - np.exp(-(L_target - 0.85) / 0.15)), L_target)
+    L_target = np.clip(L_target, 0.0, 1.0)
     
-    # 3. Smart Vibrance (boosts muted tones while protecting saturated colors)
-    max_c = np.max(graded, axis=1)
-    min_c = np.min(graded, axis=1)
-    sat = (max_c - min_c) / (max_c + 1e-6)
-    vibrance_mult = (1.0 + vib_boost * (1.0 - sat))[:, None]
+    # Melanin Skin Tone Lock
+    skin_probs = compute_oklab_skin_mask(oklab)
+    skin_blend = (skin_probs * 0.80)[:, None]
     
-    lum_g = (0.2126 * graded[:, 0] + 0.7152 * graded[:, 1] + 0.0722 * graded[:, 2])[:, None]
-    graded_vib = np.clip(lum_g + (graded - lum_g) * vibrance_mult, 0.0, 1.0)
+    graded_oklab = np.stack([L_target, a_graded, b_graded], axis=-1)
     
-    # 4. Skin Tone Preservation Gating
-    skin_probs = compute_skin_mask_vectorized(rgb)
-    skin_blend = (skin_probs * 0.75)[:, None]
-    # Skin receives smooth warm film tone without turning orange/green
-    skin_target = s_curve * 0.85 + rgb * 0.15
-    rgb_final_graded = graded_vib * (1.0 - skin_blend) + skin_target * skin_blend
+    skin_natural_L = L_norm * 0.70 + L_curved * 0.30
+    skin_natural_oklab = np.stack([skin_natural_L, a * 1.02, b * 1.04], axis=-1)
     
-    # 5. Intensity blend & Output
-    final_rgb = rgb * (1.0 - intensity) + rgb_final_graded * intensity
+    final_oklab = graded_oklab * (1.0 - skin_blend) + skin_natural_oklab * skin_blend
+    graded_rgb = oklab_to_rgb(final_oklab)
+    
+    # Anchored pure black & white
+    graded_rgb[0] = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    graded_rgb[-1] = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+    
+    final_rgb = rgb_lattice * (1.0 - intensity) + graded_rgb * intensity
     final_rgb = np.clip(final_rgb, 0.0, 1.0)
     
     with open(output_cube_path, 'w') as f:
-        f.write('TITLE "CineGrade AI Hollywood Film LUT"\n')
+        f.write(f'TITLE "CineGrade Master Film Stock - {style.upper()}"\n')
         f.write(f'LUT_3D_SIZE {lut_size}\n')
         f.write('DOMAIN_MIN 0.0 0.0 0.0\n')
         f.write('DOMAIN_MAX 1.0 1.0 1.0\n\n')
@@ -394,7 +475,7 @@ def extract_embedded_jpeg_from_raw(filepath):
         pass
     return None
 
-def run_grading_task(uid, ref_path, target_path, is_video, steps, size, ncc, output_cube, intensity=1.0, protect_skin=True, mode="reference", style="blockbuster"):
+def run_grading_task(uid, ref_path, target_path, is_video, steps, size, ncc, output_cube, intensity=1.0, protect_skin=True, mode="reference", style="vision3", is_log=False):
     tasks[uid] = {"status": "processing"}
     try:
         def load_image_with_raw_support(filepath):
@@ -423,7 +504,7 @@ def run_grading_task(uid, ref_path, target_path, is_video, steps, size, ncc, out
             target_thumb = np.array(Image.fromarray(target_image).resize((512, 512), Image.Resampling.LANCZOS))
             
             if mode == "auto":
-                generate_auto_grade_lut(target_thumb, output_cube, intensity=intensity, style=style)
+                generate_auto_grade_lut(target_thumb, output_cube, intensity=intensity, style=style, is_log=is_log)
             else:
                 reference_image = Image.open(ref_path).convert('RGB').resize((size, size))
                 reference_image_np = np.array(reference_image)
@@ -515,7 +596,7 @@ def run_grading_task(uid, ref_path, target_path, is_video, steps, size, ncc, out
                     raise Exception("Could not extract a representative frame from the video footage.")
             
             if mode == "auto":
-                generate_auto_grade_lut(frame_rgb, output_cube, intensity=intensity, style=style)
+                generate_auto_grade_lut(frame_rgb, output_cube, intensity=intensity, style=style, is_log=is_log)
             else:
                 reference_image = Image.open(ref_path).convert('RGB').resize((size, size))
                 reference_image_np = np.array(reference_image)
@@ -656,9 +737,10 @@ def process_grading(
     reference: Optional[UploadFile] = File(None),
     ref_id: Optional[str] = Form(None),
     mode: str = Form("reference"), # "reference" or "auto"
-    style: str = Form("blockbuster"), # "blockbuster", "golden_hour", "noir", "clean"
+    style: str = Form("vision3"), # "vision3", "portra", "eterna", "commercial"
     intensity: float = Form(1.0),
     protect_skin: bool = Form(True),
+    is_log: bool = Form(False),
     steps: int = Form(25),
     size: int = Form(512),
     ncc: bool = Form(True)
@@ -699,11 +781,12 @@ def process_grading(
         steps, 
         size, 
         ncc, 
-        output_cube,
-        intensity,
+        output_cube, 
+        intensity, 
         protect_skin,
         mode,
-        style
+        style,
+        is_log
     )
     
     return {"task_id": uid, "status": "processing"}
