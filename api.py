@@ -104,6 +104,20 @@ def lazy_load_grader():
         
     return grader
 
+@app.get("/")
+async def root():
+    return {
+        "status": "online",
+        "service": "CineGrade AI Studio API",
+        "version": "2.0.0",
+        "docs_url": "/docs",
+        "health_url": "/api/health"
+    }
+
+@app.get("/api/health")
+async def health_check():
+    return {"status": "healthy", "service": "CineGrade AI API"}
+
 @app.get("/api/library")
 async def get_library():
     ref_dir = "cinematic_references"
