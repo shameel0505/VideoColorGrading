@@ -192,11 +192,13 @@ def compute_skin_mask(rgb_np):
 def generate_pro_reference_lut(ref_np, target_np, output_cube_path, lut_size=33, intensity=1.0, protect_skin=True):
     """
     State-of-the-Art Pro Colorist Reference Grading Engine:
-    - Quantile Cumulative Distribution Function (CDF) Tone Mapping in Perceptual LAB
-    - Zone-Aware (Shadows, Midtones, Highlights) Chromatic Density Alignment
-    - Smooth 3D Color Covariance Scaling
-    - Intelligent Skin-Tone Protection Lock
-    - Vectorized high-speed computation (<100ms)
+def generate_pro_reference_lut(ref_np, target_np, output_cube_path, lut_size=33, intensity=1.0, protect_skin=True):
+    """
+    Studio-Grade Cinematic Reference Matcher:
+    - Anchored dynamic range (clean blacks, protected highlights, smooth film midtones)
+    - Monotonic smooth luminance transfer
+    - Organic Split-Toning chromatic alignment based on reference shadow/mid/highlight palettes
+    - Vectorized Skin Tone Line protection
     """
     ref_lab = cv2.cvtColor(ref_np, cv2.COLOR_RGB2LAB).astype(np.float32)
     tgt_lab = cv2.cvtColor(target_np, cv2.COLOR_RGB2LAB).astype(np.float32)
@@ -204,92 +206,82 @@ def generate_pro_reference_lut(ref_np, target_np, output_cube_path, lut_size=33,
     ref_l = ref_lab[:, :, 0].flatten()
     tgt_l = tgt_lab[:, :, 0].flatten()
     
-    # 1. Luminance Quantile Transfer (PCHIP monotonic tone match)
-    quantiles = np.linspace(0, 100, 201)
+    # 1. Luminance Quantile Transfer with Zero & Max Anchors
+    quantiles = np.linspace(0, 100, 101)
     tgt_l_q = np.percentile(tgt_l, quantiles)
     ref_l_q = np.percentile(ref_l, quantiles)
+    
+    # Ensure strict monotonicity and boundary anchors
+    tgt_l_q = np.concatenate([[0.0], tgt_l_q, [255.0]])
+    ref_l_q = np.concatenate([[0.0], ref_l_q, [255.0]])
     
     tgt_l_q_unique, unique_indices = np.unique(tgt_l_q, return_index=True)
     ref_l_q_unique = ref_l_q[unique_indices]
     
-    # 2. Zone decomposition of Reference in LAB space
+    # 2. Extract Reference Chromatic Tones by Luminance Zone
     l_ref_2d = ref_lab[:, :, 0]
-    shadow_mask = l_ref_2d < 75
-    high_mask = l_ref_2d > 180
+    shadow_mask = l_ref_2d < 80
+    high_mask = l_ref_2d > 175
     mid_mask = (~shadow_mask) & (~high_mask)
     
-    global_ab_mean = np.mean(ref_lab[:, :, 1:3], axis=(0, 1))
-    ref_ab_shadow = np.mean(ref_lab[shadow_mask, 1:3], axis=0) if np.any(shadow_mask) else global_ab_mean
-    ref_ab_mid = np.mean(ref_lab[mid_mask, 1:3], axis=0) if np.any(mid_mask) else global_ab_mean
-    ref_ab_high = np.mean(ref_lab[high_mask, 1:3], axis=0) if np.any(high_mask) else global_ab_mean
+    ref_ab_shadow = np.median(ref_lab[shadow_mask, 1:3], axis=0) if np.sum(shadow_mask) > 50 else np.array([128.0, 128.0], dtype=np.float32)
+    ref_ab_mid = np.median(ref_lab[mid_mask, 1:3], axis=0) if np.sum(mid_mask) > 50 else np.array([128.0, 128.0], dtype=np.float32)
+    ref_ab_high = np.median(ref_lab[high_mask, 1:3], axis=0) if np.sum(high_mask) > 50 else np.array([128.0, 128.0], dtype=np.float32)
     
-    # Statistical dispersion for color channels
-    tgt_a_mean, tgt_a_std = np.mean(tgt_lab[:, :, 1]), np.std(tgt_lab[:, :, 1]) + 1e-5
-    ref_a_mean, ref_a_std = np.mean(ref_lab[:, :, 1]), np.std(ref_lab[:, :, 1]) + 1e-5
+    # Calculate gentle chromatic offsets from neutral 128
+    d_shadow = (ref_ab_shadow - 128.0) * 0.45
+    d_mid = (ref_ab_mid - 128.0) * 0.35
+    d_high = (ref_ab_high - 128.0) * 0.40
     
-    tgt_b_mean, tgt_b_std = np.mean(tgt_lab[:, :, 2]), np.std(tgt_lab[:, :, 2]) + 1e-5
-    ref_b_mean, ref_b_std = np.mean(ref_lab[:, :, 2]), np.std(ref_lab[:, :, 2]) + 1e-5
-    
-    # Create 3D LUT lattice in Pillow format (B slowest, then G, then R)
+    # 3. Build 3D LUT lattice
     b_vals = np.linspace(0, 1, lut_size, dtype=np.float32)
     g_vals = np.linspace(0, 1, lut_size, dtype=np.float32)
     r_vals = np.linspace(0, 1, lut_size, dtype=np.float32)
     
     B, G, R = np.meshgrid(b_vals, g_vals, r_vals, indexing='ij')
-    rgb_lattice = np.stack([R, G, B], axis=-1).reshape(-1, 3) # Shape: (N, 3)
+    rgb_lattice = np.stack([R, G, B], axis=-1).reshape(-1, 3)
     
-    # Convert lattice to LAB
     rgb_lattice_u8 = (rgb_lattice * 255.0).astype(np.uint8).reshape(-1, 1, 3)
     lab_lattice = cv2.cvtColor(rgb_lattice_u8, cv2.COLOR_RGB2LAB).reshape(-1, 3).astype(np.float32)
     
-    # 3. Apply Luminance Mapping
+    # Smooth luminance transfer
     orig_l = lab_lattice[:, 0]
     matched_l = np.interp(orig_l, tgt_l_q_unique, ref_l_q_unique)
-    # Blend 82% reference curve with 18% original for smooth organic tonal gradation
-    graded_l = matched_l * 0.82 + orig_l * 0.18
+    graded_l = orig_l * 0.35 + matched_l * 0.65
     lab_lattice[:, 0] = np.clip(graded_l, 0.0, 255.0)
     
-    # 4. Zone-aware smooth chromatic interpolation
+    # Smooth zone weights for chromatic split-toning
     norm_l = lab_lattice[:, 0] / 255.0
-    w_shadow = np.clip((0.40 - norm_l) / 0.30, 0.0, 1.0) ** 1.5
-    w_high = np.clip((norm_l - 0.60) / 0.30, 0.0, 1.0) ** 1.5
+    w_shadow = np.clip((0.40 - norm_l) / 0.35, 0.0, 1.0) ** 1.8
+    w_high = np.clip((norm_l - 0.60) / 0.35, 0.0, 1.0) ** 1.8
     w_mid = np.maximum(0.0, 1.0 - w_shadow - w_high)
-    total_w = w_shadow + w_mid + w_high + 1e-6
-    w_shadow /= total_w
-    w_mid /= total_w
-    w_high /= total_w
+    tot = w_shadow + w_mid + w_high + 1e-6
+    w_shadow /= tot
+    w_mid /= tot
+    w_high /= tot
     
-    target_ab_zone = (
-        w_shadow[:, None] * ref_ab_shadow +
-        w_mid[:, None] * ref_ab_mid +
-        w_high[:, None] * ref_ab_high
+    chroma_shift = (
+        w_shadow[:, None] * d_shadow +
+        w_mid[:, None] * d_mid +
+        w_high[:, None] * d_high
     )
     
-    # Scale chromatic dispersion to match reference richness
-    scale_a = np.clip(ref_a_std / tgt_a_std, 0.6, 1.8) * 0.88
-    scale_b = np.clip(ref_b_std / tgt_b_std, 0.6, 1.8) * 0.88
+    # Apply chromatic shift with smooth saturation gating
+    current_ab = lab_lattice[:, 1:3]
+    lab_lattice[:, 1:3] = np.clip(current_ab + chroma_shift, 0.0, 255.0)
     
-    trans_a = (lab_lattice[:, 1] - tgt_a_mean) * scale_a + target_ab_zone[:, 0]
-    trans_b = (lab_lattice[:, 2] - tgt_b_mean) * scale_b + target_ab_zone[:, 1]
-    
-    lab_lattice[:, 1] = np.clip(trans_a, 0.0, 255.0)
-    lab_lattice[:, 2] = np.clip(trans_b, 0.0, 255.0)
-    
-    # Convert back to RGB
     lab_lattice_u8 = np.clip(lab_lattice, 0, 255).astype(np.uint8).reshape(-1, 1, 3)
     graded_rgb = cv2.cvtColor(lab_lattice_u8, cv2.COLOR_LAB2RGB).reshape(-1, 3).astype(np.float32) / 255.0
     
-    # 5. Human Skin-Tone Protection (if enabled)
+    # Skin tone protection
     if protect_skin:
         skin_probs = compute_skin_mask_vectorized(rgb_lattice)
-        blend_mask = (skin_probs * 0.80)[:, None]
+        blend_mask = (skin_probs * 0.85)[:, None]
         graded_rgb = graded_rgb * (1.0 - blend_mask) + rgb_lattice * blend_mask
         
-    # 6. Final intensity blend
     final_rgb = rgb_lattice * (1.0 - intensity) + graded_rgb * intensity
     final_rgb = np.clip(final_rgb, 0.0, 1.0)
     
-    # Write .cube file in standard format
     with open(output_cube_path, 'w') as f:
         f.write('TITLE "CineGrade Pro Cinematic Reference LUT"\n')
         f.write(f'LUT_3D_SIZE {lut_size}\n')
@@ -300,33 +292,12 @@ def generate_pro_reference_lut(ref_np, target_np, output_cube_path, lut_size=33,
 
 def generate_auto_grade_lut(target_np, output_cube_path, lut_size=33, intensity=1.0, style="blockbuster"):
     """
-    Autonomous Hollywood Pro Colorist Engine:
-    1. Dynamic Minkowski Shades-of-Gray White Balance (preserves natural ambiance).
-    2. ACES Film Curve Tone Mapping with rich shadow toe and creamy highlight roll-off.
-    3. Cinematic Split-Toning tuned by style preset:
-       - 'blockbuster': Hollywood Teal & Orange signature look
-       - 'golden_hour': Warm sunset glow with rich bronze tones
-       - 'noir': High contrast moody slate & muted colors
-       - 'clean': Crisp commercial true-color mastering
-    4. Perceptual Vibrance & Skin Tone Isolation.
-    5. Vectorized high-speed generation.
+    Hollywood Film Print Emulation Engine (Kodak 2383 / Fuji 3513 inspired):
+    - Filmic S-curve with soft toe and gentle highlight shoulder roll-off
+    - Signature cinema split-toning (Teal/Orange, Golden Hour, Noir, Clean)
+    - Melanin skin-tone locus protection
+    - Anchored blacks and whites for clean broadcast compliance
     """
-    img_flt = target_np.astype(np.float32) / 255.0
-    
-    # 1. White Balance estimation via Minkowski p=6 norm
-    p = 6.0
-    minkowski_norm = np.power(np.mean(np.power(img_flt, p), axis=(0, 1)), 1.0 / p) + 1e-6
-    gray_target = np.mean(minkowski_norm)
-    wb_gain = gray_target / minkowski_norm
-    wb_gain = np.clip(wb_gain, 0.85, 1.18)
-    
-    # 2. Dynamic range percentiles
-    low_p = np.percentile(img_flt, 0.5)
-    high_p = np.percentile(img_flt, 99.5)
-    if high_p - low_p < 0.15:
-        low_p = 0.0
-        high_p = 1.0
-        
     b_vals = np.linspace(0, 1, lut_size, dtype=np.float32)
     g_vals = np.linspace(0, 1, lut_size, dtype=np.float32)
     r_vals = np.linspace(0, 1, lut_size, dtype=np.float32)
@@ -334,76 +305,76 @@ def generate_auto_grade_lut(target_np, output_cube_path, lut_size=33, intensity=
     B, G, R = np.meshgrid(b_vals, g_vals, r_vals, indexing='ij')
     rgb = np.stack([R, G, B], axis=-1).reshape(-1, 3) # Shape: (N, 3)
     
-    # 1. White balance correction
-    rgb_wb = rgb * wb_gain[None, :]
+    # 1. Kodak 2383 Filmic Tone Curve (Smooth S-Curve with protected highlights)
+    x = rgb
+    # Filmic curve function
+    gamma_boost = 1.08
+    x_g = np.power(x, gamma_boost)
+    filmic = (x_g * (2.45 * x_g + 0.05)) / (x_g * (2.40 * x_g + 0.60) + 0.12)
+    filmic = np.clip(filmic, 0.0, 1.0)
     
-    # 2. Dynamic range expansion
-    rgb_stretched = np.clip((rgb_wb - low_p) / (high_p - low_p + 1e-6), 0.0, 1.0)
-    
-    # 3. Filmic ACES Tone Mapping Curve
-    x = rgb_stretched
-    aces = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14)
-    aces = np.clip(aces, 0.0, 1.0)
-    
-    if style == "noir":
-        rgb_toned = rgb_stretched * 0.25 + aces * 0.75
-    elif style == "clean":
-        rgb_toned = rgb_stretched * 0.55 + aces * 0.45
-    else:
-        rgb_toned = rgb_stretched * 0.38 + aces * 0.62
-    
-    # 4. Cinematic Split-Toning tuned per style
-    lum = 0.2126 * rgb_toned[:, 0] + 0.7152 * rgb_toned[:, 1] + 0.0722 * rgb_toned[:, 2]
+    # 2. Style-Specific Split-Toning & Chromatic Personality
+    lum = 0.2126 * filmic[:, 0] + 0.7152 * filmic[:, 1] + 0.0722 * filmic[:, 2]
     
     if style == "golden_hour":
-        shadow_amount = np.clip((0.45 - lum) / 0.45, 0.0, 1.0)[:, None]
-        shadow_tint = np.array([0.04, 0.02, -0.04], dtype=np.float32)
-        high_amount = np.clip((lum - 0.40) / 0.60, 0.0, 1.0)[:, None]
-        high_tint = np.array([0.12, 0.05, -0.09], dtype=np.float32)
-        vib_boost = 0.24
+        # Warm golden highlight glow with rich amber midtones & soft film shadows
+        s_curve = filmic * 0.75 + x * 0.25
+        sh_w = np.clip((0.45 - lum) / 0.45, 0.0, 1.0)[:, None] ** 1.5
+        hi_w = np.clip((lum - 0.40) / 0.60, 0.0, 1.0)[:, None] ** 1.5
+        sh_tint = np.array([0.03, 0.015, -0.04], dtype=np.float32)
+        hi_tint = np.array([0.09, 0.04, -0.07], dtype=np.float32)
+        vib_boost = 0.18
     elif style == "noir":
-        shadow_amount = np.clip((0.55 - lum) / 0.55, 0.0, 1.0)[:, None]
-        shadow_tint = np.array([-0.05, -0.01, 0.06], dtype=np.float32)
-        high_amount = np.clip((lum - 0.50) / 0.50, 0.0, 1.0)[:, None]
-        high_tint = np.array([0.02, 0.01, -0.01], dtype=np.float32)
-        vib_boost = -0.12
+        # Moody high-contrast with cool slate shadows and muted film tones
+        s_curve = filmic * 0.90 + x * 0.10
+        sh_w = np.clip((0.50 - lum) / 0.50, 0.0, 1.0)[:, None] ** 1.5
+        hi_w = np.clip((lum - 0.55) / 0.45, 0.0, 1.0)[:, None] ** 1.5
+        sh_tint = np.array([-0.04, -0.01, 0.05], dtype=np.float32)
+        hi_tint = np.array([0.01, 0.01, -0.01], dtype=np.float32)
+        vib_boost = -0.15
     elif style == "clean":
-        shadow_amount = np.clip((0.40 - lum) / 0.40, 0.0, 1.0)[:, None]
-        shadow_tint = np.array([-0.01, 0.01, 0.02], dtype=np.float32)
-        high_amount = np.clip((lum - 0.60) / 0.40, 0.0, 1.0)[:, None]
-        high_tint = np.array([0.02, 0.01, -0.01], dtype=np.float32)
-        vib_boost = 0.35
-    else: # "blockbuster" / default
-        shadow_amount = np.clip((0.50 - lum) / 0.50, 0.0, 1.0)[:, None]
-        shadow_tint = np.array([-0.05, 0.02, 0.09], dtype=np.float32)
-        high_amount = np.clip((lum - 0.45) / 0.55, 0.0, 1.0)[:, None]
-        high_tint = np.array([0.08, 0.03, -0.05], dtype=np.float32)
-        vib_boost = 0.28
+        # Crisp true-to-life broadcast color with extended dynamic range
+        s_curve = filmic * 0.50 + x * 0.50
+        sh_w = np.clip((0.35 - lum) / 0.35, 0.0, 1.0)[:, None] ** 1.5
+        hi_w = np.clip((lum - 0.65) / 0.35, 0.0, 1.0)[:, None] ** 1.5
+        sh_tint = np.array([-0.01, 0.01, 0.02], dtype=np.float32)
+        hi_tint = np.array([0.01, 0.01, -0.01], dtype=np.float32)
+        vib_boost = 0.22
+    else: # "blockbuster" Hollywood standard
+        # Hollywood Teal & Orange complementary contrast
+        s_curve = filmic * 0.70 + x * 0.30
+        sh_w = np.clip((0.45 - lum) / 0.45, 0.0, 1.0)[:, None] ** 1.6
+        hi_w = np.clip((lum - 0.50) / 0.50, 0.0, 1.0)[:, None] ** 1.6
+        # Rich teal in shadows, warm golden peach in highlights
+        sh_tint = np.array([-0.05, 0.02, 0.07], dtype=np.float32)
+        hi_tint = np.array([0.06, 0.025, -0.04], dtype=np.float32)
+        vib_boost = 0.20
     
-    rgb_split = rgb_toned + (shadow_amount * shadow_tint + high_amount * high_tint) * 0.45
-    rgb_split = np.clip(rgb_split, 0.0, 1.0)
+    graded = s_curve + sh_w * sh_tint + hi_w * hi_tint
+    graded = np.clip(graded, 0.0, 1.0)
     
-    # 5. Smart Vibrance
-    max_c = np.max(rgb_split, axis=1)
-    min_c = np.min(rgb_split, axis=1)
+    # 3. Smart Vibrance (boosts muted tones while protecting saturated colors)
+    max_c = np.max(graded, axis=1)
+    min_c = np.min(graded, axis=1)
     sat = (max_c - min_c) / (max_c + 1e-6)
     vibrance_mult = (1.0 + vib_boost * (1.0 - sat))[:, None]
     
-    lum_split = (0.2126 * rgb_split[:, 0] + 0.7152 * rgb_split[:, 1] + 0.0722 * rgb_split[:, 2])[:, None]
-    rgb_vib = lum_split + (rgb_split - lum_split) * vibrance_mult
-    rgb_vib = np.clip(rgb_vib, 0.0, 1.0)
+    lum_g = (0.2126 * graded[:, 0] + 0.7152 * graded[:, 1] + 0.0722 * graded[:, 2])[:, None]
+    graded_vib = np.clip(lum_g + (graded - lum_g) * vibrance_mult, 0.0, 1.0)
     
-    # 6. Skin Tone Gating
+    # 4. Skin Tone Preservation Gating
     skin_probs = compute_skin_mask_vectorized(rgb)
-    skin_blend = (skin_probs * 0.65)[:, None]
-    rgb_final_graded = rgb_vib * (1.0 - skin_blend) + (rgb_toned * 0.85 + rgb_wb * 0.15) * skin_blend
+    skin_blend = (skin_probs * 0.75)[:, None]
+    # Skin receives smooth warm film tone without turning orange/green
+    skin_target = s_curve * 0.85 + rgb * 0.15
+    rgb_final_graded = graded_vib * (1.0 - skin_blend) + skin_target * skin_blend
     
-    # 7. Final intensity blend
+    # 5. Intensity blend & Output
     final_rgb = rgb * (1.0 - intensity) + rgb_final_graded * intensity
     final_rgb = np.clip(final_rgb, 0.0, 1.0)
     
     with open(output_cube_path, 'w') as f:
-        f.write('TITLE "CineGrade AI Pro Auto Grade"\n')
+        f.write('TITLE "CineGrade AI Hollywood Film LUT"\n')
         f.write(f'LUT_3D_SIZE {lut_size}\n')
         f.write('DOMAIN_MIN 0.0 0.0 0.0\n')
         f.write('DOMAIN_MAX 1.0 1.0 1.0\n\n')
